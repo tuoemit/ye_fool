@@ -1,4 +1,4 @@
-import asyncio
+Import asyncio
 import json
 import os
 import hashlib
@@ -48,10 +48,6 @@ CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
 SESSION_COOKIE = "ren_session"
 SESSION_TTL = 60 * 60 * 24 * 7
 UNLIMITED_QUOTA_BYTES = 53687091200000
-
-# ── Allowed ports for inbounds (front ports that proxy back to the same origin) ──
-ALLOWED_PORTS = [443, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096, 2080, 8080, 8443, 80]
-DEFAULT_PORT = 443
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 def hash_password(pw: str) -> str:
@@ -130,26 +126,16 @@ def generate_uuid(seed: str | None = None) -> str:
     h = hashlib.sha256(f"{seed}{CONFIG['secret']}".encode()).hexdigest()
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
-def normalize_port(value, default: int = DEFAULT_PORT) -> int:
-    try:
-        p = int(value)
-    except (TypeError, ValueError):
-        return default
-    if p < 1 or p > 65535:
-        return default
-    return p
-
-def generate_vless_link(uuid: str, remark: str = "Luffy", address: str = None, port: int = None) -> str:
+def generate_vless_link(uuid: str, remark: str = "Luffy", address: str = None) -> str:
     domain = get_domain()
     addr = address if address else domain
-    use_port = normalize_port(port) if port else DEFAULT_PORT
     path = f"/ws/{uuid}"
     params = {
         "encryption": "none", "security": "tls", "type": "ws",
         "host": domain, "path": path, "sni": domain, "fp": "chrome", "alpn": "http/1.1"
     }
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-    return f"vless://{uuid}@{addr}:{use_port}?{query}#{quote(remark)}"
+    return f"vless://{uuid}@{addr}:443?{query}#{quote(remark)}"
 
 def uptime() -> str:
     secs = int(time.time() - stats["start_time"])
@@ -193,7 +179,6 @@ async def ensure_default_link():
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "active": True,
                 "expires_at": None,
-                "port": DEFAULT_PORT,
             }
 
 def get_client_ip(websocket: WebSocket) -> str:
@@ -303,10 +288,6 @@ async def get_stats(_=Depends(require_auth)):
         "hourly_traffic": dict(hourly_traffic),
     }
 
-@app.get("/api/ports")
-async def list_ports(_=Depends(require_auth)):
-    return {"ports": ALLOWED_PORTS, "default": DEFAULT_PORT}
-
 @app.post("/api/links")
 async def create_link(request: Request, _=Depends(require_auth)):
     body = await request.json()
@@ -324,7 +305,6 @@ async def create_link(request: Request, _=Depends(require_auth)):
     max_conn = int(body.get("max_connections") or 0)
     if max_conn < 0:
         max_conn = 0
-    port = normalize_port(body.get("port"), DEFAULT_PORT)
     days_valid = body.get("days_valid")
     expires_at: str | None = None
     if days_valid is not None:
@@ -344,13 +324,11 @@ async def create_link(request: Request, _=Depends(require_auth)):
             "created_at": datetime.now(timezone.utc).isoformat(),
             "active": True,
             "expires_at": expires_at,
-            "port": port,
         }
     return {
         "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
         "max_connections": max_conn, "active": True, "created_at": LINKS[uid]["created_at"],
-        "expires_at": expires_at, "port": port,
-        "vless_link": generate_vless_link(uid, remark=f"Luffy-{label}", port=port),
+        "expires_at": expires_at, "vless_link": generate_vless_link(uid, remark=f"Luffy-{label}"),
     }
 
 @app.get("/api/links")
@@ -359,7 +337,6 @@ async def list_links(_=Depends(require_auth)):
     async with LINKS_LOCK:
         items = list(LINKS.items())
     for uid, data in items:
-        link_port = data.get("port", DEFAULT_PORT)
         result.append({
             "uuid": uid,
             "label": data["label"],
@@ -369,9 +346,8 @@ async def list_links(_=Depends(require_auth)):
             "active": data["active"],
             "created_at": data["created_at"],
             "expires_at": data.get("expires_at"),
-            "port": link_port,
             "current_connections": await count_connections_for_link(uid),  # FIX: await
-            "vless_link": generate_vless_link(uid, remark=f"Luffy-{data['label']}", port=link_port),
+            "vless_link": generate_vless_link(uid, remark=f"Luffy-{data['label']}"),
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
@@ -395,8 +371,6 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
         if "max_connections" in body:
             mc = int(body["max_connections"] or 0)
             LINKS[uid]["max_connections"] = mc if mc >= 0 else 0
-        if "port" in body:
-            LINKS[uid]["port"] = normalize_port(body.get("port"), LINKS[uid].get("port", DEFAULT_PORT))
         if "days_valid" in body:
             try:
                 dv = int(body["days_valid"])
@@ -434,12 +408,6 @@ async def add_address(request: Request, _=Depends(require_auth)):
         CUSTOM_ADDRESSES.append(address)
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
 
-@app.delete("/api/addresses")
-async def delete_all_addresses(_=Depends(require_auth)):
-    async with CUSTOM_ADDRESSES_LOCK:
-        CUSTOM_ADDRESSES.clear()
-    return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
-
 @app.delete("/api/addresses/{index}")
 async def delete_address(index: int, _=Depends(require_auth)):
     async with CUSTOM_ADDRESSES_LOCK:
@@ -457,8 +425,7 @@ async def get_subscription(uid: str, _=Depends(require_auth)):
         if link is None:
             raise HTTPException(status_code=404, detail="link not found")
         link = dict(link)
-    link_port = link.get("port", DEFAULT_PORT)
-    vless_link = generate_vless_link(uid, remark=f"Luffy-{link['label']}", port=link_port)
+    vless_link = generate_vless_link(uid, remark=f"Luffy-{link['label']}")
     used = link["used_bytes"]
     limit = link["limit_bytes"]
     used_mb = round(used / (1024 * 1024), 2)
@@ -484,7 +451,6 @@ def _fmt_bytes(b: int) -> str:
 def generate_subscription_content(link: dict, uid: str, addresses: list[str]) -> str:
     used = link["used_bytes"]
     limit = link["limit_bytes"]
-    link_port = link.get("port", DEFAULT_PORT)
     expires_at_str = link.get("expires_at")
     usage_str = f"{_fmt_bytes(used)} / ∞" if limit == 0 else f"{_fmt_bytes(used)} / {_fmt_bytes(limit)}"
     secs_left = seconds_until_expiry(expires_at_str)
@@ -494,10 +460,10 @@ def generate_subscription_content(link: dict, uid: str, addresses: list[str]) ->
         expiry_str = "Expired"
     else:
         expiry_str = f"{secs_left // 86400} Days Left"
-    status_node = generate_vless_link(uid, remark=f"📊 {usage_str} | ⏳ {expiry_str}", address="0.0.0.0", port=link_port)
-    links_out = [status_node, generate_vless_link(uid, remark=f"Luffy-{link['label']}-Server", port=link_port)]
+    status_node = generate_vless_link(uid, remark=f"📊 {usage_str} | ⏳ {expiry_str}", address="0.0.0.0")
+    links_out = [status_node, generate_vless_link(uid, remark=f"Luffy-{link['label']}-Server")]
     for i, addr in enumerate(addresses):
-        links_out.append(generate_vless_link(uid, remark=f"Luffy-{link['label']}-IP{i+1}", address=addr, port=link_port))
+        links_out.append(generate_vless_link(uid, remark=f"Luffy-{link['label']}-IP{i+1}", address=addr))
     return "\n".join(links_out)
 
 @app.get("/sub/{uid}")
@@ -865,7 +831,6 @@ body[dir="rtl"]{direction:rtl;text-align:right}
 .tbl td{padding:9px 11px;border-bottom:1px solid var(--border);font-size:12.5px;vertical-align:middle}
 .tag{display:inline-flex;align-items:center;padding:2px 7px;border-radius:4px;font-size:9px;font-weight:800;letter-spacing:.05em;text-transform:uppercase}
 .tag-vless{background:var(--gold-dim);color:var(--gold);border:1px solid var(--border)}
-.tag-port{background:rgba(167,139,250,.1);color:#a78bfa;border:1px solid rgba(167,139,250,.2)}
 .tag-on{background:var(--green-dim);color:var(--green);border:1px solid rgba(74,222,128,.2)}
 .tag-off{background:var(--red-dim);color:var(--red);border:1px solid rgba(248,113,113,.2)}
 .pill{display:flex;align-items:center;gap:7px;font-size:11px}
@@ -1134,7 +1099,6 @@ body[dir="rtl"]{direction:rtl;text-align:right}
               <th data-en="#" data-fa="#">#</th>
               <th data-en="Name" data-fa="نام">Name</th>
               <th data-en="Type" data-fa="نوع">Type</th>
-              <th data-en="Port" data-fa="پورت">Port</th>
               <th data-en="Usage" data-fa="مصرف">Usage</th>
               <th data-en="IPs" data-fa="آی‌پی">IPs</th>
               <th data-en="Expiry" data-fa="انقضا">Expiry</th>
@@ -1163,10 +1127,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
     <section class="page" id="page-addresses">
       <div class="page-header">
         <div><div class="page-title" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</div><div class="page-sub" data-en="Subscription alternative addresses" data-fa="آدرس‌های جایگزین اشتراک">Subscription alternative addresses</div></div>
-        <div style="display:flex;gap:6px">
-          <button class="btn btn-danger" onclick="delAllAddrs()" data-en="Delete All" data-fa="پاک کردن همه">Delete All</button>
-          <button class="btn btn-gold" onclick="showAddAddrMo()" data-en="+ Add" data-fa="+ افزودن">+ Add</button>
-        </div>
+        <button class="btn btn-gold" onclick="showAddAddrMo()" data-en="+ Add" data-fa="+ افزودن">+ Add</button>
       </div>
       <div class="card">
         <div style="font-size:12px;color:var(--text3);margin-bottom:12px" data-en="Default: www.speedtest.net" data-fa="پیش‌فرض: www.speedtest.net">Default: www.speedtest.net</div>
@@ -1197,7 +1158,6 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="nv" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
       <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="nu"><option>GB</option></select></div>
     </div>
-    <div class="fg"><label class="fl" data-en="Port" data-fa="پورت">Port</label><select class="fs" id="np"></select></div>
     <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="nc" type="number" min="0" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
     <div class="fg"><label class="fl" data-en="Days Valid" data-fa="روزهای اعتبار">Days Valid</label><input class="fi" id="nd" type="number" min="0" data-ph-en="0 = No expiry" data-ph-fa="۰ = بدون انقضا" placeholder="0 = No expiry"></div>
     <button class="btn btn-gold" onclick="createLink()" style="width:100%;justify-content:center;margin-top:12px;padding:12px;" data-en="CREATE" data-fa="ایجاد">CREATE</button>
@@ -1214,7 +1174,6 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="el" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
       <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="eu2"><option>GB</option></select></div>
     </div>
-    <div class="fg"><label class="fl" data-en="Port" data-fa="پورت">Port</label><select class="fs" id="ep"></select></div>
     <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="ec" type="number" min="0" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
     <div class="fg"><label class="fl" data-en="Extend Days" data-fa="افزایش روزها">Extend Days</label><input class="fi" id="ed" type="number" min="0" data-ph-en="0 = no change" data-ph-fa="۰ = بدون تغییر" placeholder="0 = no change"></div>
     <div style="display:flex;gap:10px;margin-top:16px">
@@ -1254,7 +1213,7 @@ const langMap={
   en:{edit:'Edit',copy:'Copy',sub:'Sub',qr:'QR',del:'Del'},
   fa:{edit:'ویرایش',copy:'کپی',sub:'اشتراک',qr:'QR',del:'حذف'}
 };
-function tr(key){return(langMap[lang]&&langMap[lang][key])||langMap['en'][key]||key;}
+function tr(key){return(langMap[lang]&&langMap[lang][key])langMap['en'][key]key;}
 
 let lang=localStorage.getItem('ll')||'en';
 let theme=localStorage.getItem('theme')||'dark';
@@ -1264,8 +1223,6 @@ let sData={};
 let tChart=null;
 let allAddrs=[];
 let isAuthenticated=false;
-let availablePorts=[443,2052,2053,2082,2083,2086,2087,2095,2096,2080,8080,8443,80];
-let defaultPort=443;
 
 // ── Theme ────────────────────────────────────────────────────────────────────
 function setTheme(t){
@@ -1324,7 +1281,6 @@ function showDashboard(){
   $m('login-page').style.display='none';
   $m('dashboard-page').style.display='';
   initChart();
-  loadPorts();
   loadStats();
   loadLinks();
   loadAddrs();
@@ -1397,25 +1353,6 @@ function fmtExp(ea){
   return Math.floor(d/60000)+'m';
 }
 
-// ── Ports ─────────────────────────────────────────────────────────────────────
-async function loadPorts(){
-  try{
-    const r=await fetch('/api/ports');
-    if(!r.ok)throw new Error();
-    const d=await r.json();
-    if(d.ports&&d.ports.length)availablePorts=d.ports;
-    if(d.default)defaultPort=d.default;
-  }catch(e){/* keep client-side defaults */}
-  fillPortSelect('np',defaultPort);
-  fillPortSelect('ep',defaultPort);
-}
-
-function fillPortSelect(id,selected){
-  const sel=$m(id);
-  if(!sel)return;
-  sel.innerHTML=availablePorts.map(p=>`<option value="${p}"${p===selected?' selected':''}>${p}</option>`).join('');
-}
-
 // ── Links ─────────────────────────────────────────────────────────────────────
 function setFilter(filter,el){
   cf=filter;
@@ -1441,7 +1378,7 @@ function renderLinks(links){
     tb.innerHTML='';
     mc.innerHTML='';
     em.style.display='block';
-    const emptyText=em.getAttribute('data-'+lang)||em.getAttribute('data-en')||'No inbounds found';
+    const emptyText=em.getAttribute('data-'+lang)em.getAttribute('data-en')'No inbounds found';
     em.textContent=emptyText;
     return;
   }
@@ -1457,8 +1394,7 @@ function renderLinks(links){
     const i=idx--;
     const cc=l.current_connections||0;
     const mc2=l.max_connections||0;
-    const pt=l.port||defaultPort;
-    return{l,pct,col,ex,ec,i,cc,mc2,u,lim,pt};
+    return{l,pct,col,ex,ec,i,cc,mc2,u,lim};
   });
 
   const editText=tr('edit');
@@ -1467,11 +1403,10 @@ function renderLinks(links){
   const qrText=tr('qr');
   const delText=tr('del');
 
-  tb.innerHTML=rows.map(r=>`<tr>
+  tb.innerHTML=rows.map(r=><tr>
     <td style="color:var(--text3);font-size:10.5px">${r.i}</td>
     <td style="font-weight:600">${esc(r.l.label)}</td>
     <td><span class="tag tag-vless">VLESS</span></td>
-    <td><span class="tag tag-port">${r.pt}</span></td>
     <td><div class="pill"><span class="pill-used">${fmtB(r.u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class="pill-lim">${fmtLim(r.lim)}</span></div></td>
     <td style="font-size:11px;font-weight:600;color:${r.mc2>0&&r.cc>=r.mc2?'var(--red)':'var(--text2)'}">${r.cc}/${r.mc2||'∞'}</td>
     <td style="font-size:10.5px;font-weight:700;color:${r.ec}">${r.ex}</td>
@@ -1484,15 +1419,14 @@ function renderLinks(links){
       <button class="act-btn act-qr" onclick="showQR('${esc(r.l.vless_link||'')}')">${qrText}</button>
       <button class="act-btn act-del" onclick="delLink('${r.l.uuid}')">${delText}</button>
     </div></td>
-  </tr>`).join('');
+  </tr>).join('');
 
-  mc.innerHTML=rows.map(r=>`<div class="m-card">
+  mc.innerHTML=rows.map(r=><div class="m-card">
     <div class="m-card-hd">
       <div style="display:flex;align-items:center;gap:7px">
         <span style="font-size:11px;color:var(--text3)">#${r.i}</span>
         <span style="font-weight:600;font-size:14px">${esc(r.l.label)}</span>
         <span class="tag tag-vless">VLESS</span>
-        <span class="tag tag-port">${r.pt}</span>
       </div>
       <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uuid}" onclick="togLink(this)"></button>
     </div>
@@ -1505,7 +1439,7 @@ function renderLinks(links){
       <button class="act-btn act-qr" onclick="showQR('${esc(r.l.vless_link||'')}')">${qrText}</button>
       <button class="act-btn act-del" onclick="delLink('${r.l.uuid}')">${delText}</button>
     </div>
-  </div>`).join('');
+  </div>).join('');
 }
 
 async function togLink(el){
@@ -1533,7 +1467,7 @@ async function qCreate(v,u){
     const r=await fetch('/api/links',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({label:n,limit_value:v,limit_unit:u,port:defaultPort})
+      body:JSON.stringify({label:n,limit_value:v,limit_unit:u})
     });
     if(!r.ok)throw new Error();
     toast('Created: '+n);
@@ -1542,7 +1476,7 @@ async function qCreate(v,u){
   }catch(e){toast('Error creating link',true);}
 }
 
-function showAddMo(){fillPortSelect('np',defaultPort);$m('mo-add').classList.add('show');}
+function showAddMo(){$m('mo-add').classList.add('show');}
 
 async function createLink(){
   const label=$m('nl').value.trim()||'New Link';
@@ -1550,12 +1484,11 @@ async function createLink(){
   const v=parseFloat($m('nv').value)||0;
   const mc=parseInt($m('nc').value)||0;
   const days=parseInt($m('nd').value)||0;
-  const port=parseInt($m('np').value)||defaultPort;
   try{
     const r=await fetch('/api/links',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({label,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days,port})
+      body:JSON.stringify({label,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days})
     });
     if(!r.ok)throw new Error();
     toast('Created');
@@ -1574,7 +1507,6 @@ function showEditMo(uid){
   $m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';
   $m('ec').value=l.max_connections>0?l.max_connections:'';
   $m('ed').value='';
-  fillPortSelect('ep',l.port||defaultPort);
   $m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ')+l.label;
   $m('mo-edit').classList.add('show');
 }
@@ -1584,8 +1516,7 @@ async function saveEdit(){
   const v=parseFloat($m('el').value)||0;
   const mc=parseInt($m('ec').value)||0;
   const days=parseInt($m('ed').value)||0;
-  const port=parseInt($m('ep').value)||defaultPort;
-  const body={limit_value:v,limit_unit:'GB',max_connections:mc,port};
+  const body={limit_value:v,limit_unit:'GB',max_connections:mc};
   if(days>0)body.days_valid=days;
   try{
     const r=await fetch('/api/links/'+uid,{
@@ -1777,13 +1708,13 @@ function renderAddrs(){
     el.innerHTML='<div style="color:var(--text3);font-size:12px">No addresses added</div>';
     return;
   }
-  el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px">
+  el.innerHTML=allAddrs.map((a,i)=><div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px">
     <div style="display:flex;align-items:center;gap:10px">
       <span style="color:var(--gold);font-size:16px">🌐</span>
       <div><div style="font-size:14px;font-weight:600">${esc(a)}</div><div style="font-size:11px;color:var(--text3);margin-top:2px;">Address #${i+1}</div></div>
     </div>
     <button class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</button>
-  </div>`).join('');
+  </div>).join('');
 }
 
 function showAddAddrMo(){$m('na').value='';$m('mo-addr').classList.add('show');}
@@ -1813,17 +1744,6 @@ async function delAddr(i){
     const r=await fetch('/api/addresses/'+i,{method:'DELETE'});
     if(!r.ok)throw new Error();
     toast('Deleted');
-    await loadAddrs();
-  }catch(e){toast('Error deleting',true);}
-}
-
-async function delAllAddrs(){
-  if(!allAddrs||!allAddrs.length){toast('No addresses to delete',true);return;}
-  if(!confirm('Delete ALL clean IP addresses? This cannot be undone.'))return;
-  try{
-    const r=await fetch('/api/addresses',{method:'DELETE'});
-    if(!r.ok)throw new Error();
-    toast('All addresses deleted');
     await loadAddrs();
   }catch(e){toast('Error deleting',true);}
 }
@@ -1858,5 +1778,5 @@ async def dashboard_page(request: Request):
 async def panel_page(request: Request):
     return HTMLResponse(content=PANEL_HTML)
 
-if __name__ == "__main__":
+if name == "main":
     uvicorn.run(app, host="0.0.0.0", port=CONFIG["port"])
